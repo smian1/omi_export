@@ -29,7 +29,7 @@ import json
 import os
 import sys
 import argparse
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1030,10 +1030,18 @@ Examples:
         # Convert to UTC for the API
         start_utc = start_local.astimezone(ZoneInfo("UTC"))
         end_utc = end_local.astimezone(ZoneInfo("UTC"))
-        
-        # Format as ISO 8601 strings with Z suffix (UTC)
-        QUERY_START = start_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
-        QUERY_END = end_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        # For API query, use full UTC day boundaries with 1-day buffer on each side
+        # This ensures we capture all conversations that might fall within the user's
+        # local timezone date range, even across timezone boundaries.
+        # The client-side filtering (filter_conversations_by_date) will then narrow
+        # down to the exact timezone-adjusted range.
+        query_start_date = start_utc.date() - timedelta(days=1)
+        query_end_date = end_utc.date() + timedelta(days=1)
+
+        # Format as ISO 8601 strings with Z suffix (UTC) using midnight boundaries
+        QUERY_START = f"{query_start_date}T00:00:00Z"
+        QUERY_END = f"{query_end_date}T23:59:59Z"
 
         # Display configuration summary
         if not args.interactive:
@@ -1240,139 +1248,139 @@ Examples:
                 
                 if day_key not in files_written:
                     files_written.add(day_key)
-    
-        # Run the retrieval function with incremental processing callback
-        print_info("🚀 Starting conversation retrieval...\n")
-        results = get_conversations(start_date=QUERY_START, end_date=QUERY_END, callback=process_batch)
-        
-        # Final summary for conversations
-        print_header("🎉 CONVERSATION EXPORT COMPLETE!")
-        print_success(f"Total conversations retrieved: {Colors.BOLD}{len(results)}{Colors.END}")
-        print_success(f"Total days with conversations: {Colors.BOLD}{len([k for k in conversations_by_day.keys() if k != 'unknown'])}{Colors.END}")
-        
-        if final_organize_by_month:
-            # Group files by month for summary
-            files_by_month = defaultdict(list)
-            for day_key in conversations_by_day.keys():
-                if day_key == "unknown":
-                    month_folder = "unknown"
-                    base_filename = "conversation_export_unknown"
-                else:
-                    year_month = day_key[:7]  # Gets "YYYY-MM"
-                    month_folder = year_month
-                    base_filename = f"conversation_export_{day_key}"
-                
-                day_conversations = conversations_by_day[day_key]
-                
+
+    # Run the retrieval function with incremental processing callback
+    print_info("🚀 Starting conversation retrieval...\n")
+    results = get_conversations(start_date=QUERY_START, end_date=QUERY_END, callback=process_batch)
+
+    # Final summary for conversations
+    print_header("🎉 CONVERSATION EXPORT COMPLETE!")
+    print_success(f"Total conversations retrieved: {Colors.BOLD}{len(results)}{Colors.END}")
+    print_success(f"Total days with conversations: {Colors.BOLD}{len([k for k in conversations_by_day.keys() if k != 'unknown'])}{Colors.END}")
+
+    if final_organize_by_month:
+        # Group files by month for summary
+        files_by_month = defaultdict(list)
+        for day_key in conversations_by_day.keys():
+            if day_key == "unknown":
+                month_folder = "unknown"
+                base_filename = "conversation_export_unknown"
+            else:
+                year_month = day_key[:7]  # Gets "YYYY-MM"
+                month_folder = year_month
+                base_filename = f"conversation_export_{day_key}"
+
+            day_conversations = conversations_by_day[day_key]
+
+            if final_separate_transcripts:
+                # Count conversations with transcripts
+                conversations_with_transcripts = sum(1 for conv in day_conversations if conv.get("transcript_segments"))
+                metadata_filename = f"{base_filename}.json"
+                transcript_filename = f"{base_filename}_transcripts.json"
+                files_by_month[month_folder].append((day_key, metadata_filename, len(day_conversations), transcript_filename, conversations_with_transcripts))
+            else:
+                filename = f"{base_filename}.json"
+                files_by_month[month_folder].append((day_key, filename, len(day_conversations), None, 0))
+
+        print(f"\n{Colors.CYAN}📁 Files organized by month in '{EXPORT_FOLDER}/':{Colors.END}")
+
+        # Print summary organized by month
+        for month_folder in sorted(files_by_month.keys()):
+            files_in_month = files_by_month[month_folder]
+            total_conversations = sum(count for _, _, count, _, _ in files_in_month)
+
+            # Format month name nicely (e.g., "2025-01" -> "January 2025")
+            if month_folder != "unknown":
+                try:
+                    year, month = month_folder.split("-")
+                    month_num = int(month)
+                    month_names = ["", "January", "February", "March", "April", "May", "June",
+                                  "July", "August", "September", "October", "November", "December"]
+                    month_name = f"{month_names[month_num]} {year}"
+                except:
+                    month_name = month_folder
+            else:
+                month_name = "Unknown"
+
+            file_count = len(files_in_month) * (2 if final_separate_transcripts else 1)
+            print(f"\n  {Colors.CYAN}📂 {Colors.BOLD}{month_name}{Colors.END} ({Colors.CYAN}{month_folder}/{Colors.END})")
+            print(f"     {Colors.GREEN}{file_count}{Colors.END} files, {Colors.BOLD}{total_conversations}{Colors.END} total conversations")
+            for day_key, filename, count, transcript_filename, transcript_count in sorted(files_in_month):
                 if final_separate_transcripts:
-                    # Count conversations with transcripts
-                    conversations_with_transcripts = sum(1 for conv in day_conversations if conv.get("transcript_segments"))
-                    metadata_filename = f"{base_filename}.json"
-                    transcript_filename = f"{base_filename}_transcripts.json"
-                    files_by_month[month_folder].append((day_key, metadata_filename, len(day_conversations), transcript_filename, conversations_with_transcripts))
+                    print(f"     {Colors.CYAN}•{Colors.END} {filename}: {Colors.BOLD}{count}{Colors.END} conversations")
+                    if transcript_count > 0:
+                        print(f"     {Colors.CYAN}•{Colors.END} {transcript_filename}: {Colors.BOLD}{transcript_count}{Colors.END} transcripts")
                 else:
-                    filename = f"{base_filename}.json"
-                    files_by_month[month_folder].append((day_key, filename, len(day_conversations), None, 0))
-            
-            print(f"\n{Colors.CYAN}📁 Files organized by month in '{EXPORT_FOLDER}/':{Colors.END}")
-            
-            # Print summary organized by month
-            for month_folder in sorted(files_by_month.keys()):
-                files_in_month = files_by_month[month_folder]
-                total_conversations = sum(count for _, _, count, _, _ in files_in_month)
-                
-                # Format month name nicely (e.g., "2025-01" -> "January 2025")
-                if month_folder != "unknown":
-                    try:
-                        year, month = month_folder.split("-")
-                        month_num = int(month)
-                        month_names = ["", "January", "February", "March", "April", "May", "June",
-                                      "July", "August", "September", "October", "November", "December"]
-                        month_name = f"{month_names[month_num]} {year}"
-                    except:
-                        month_name = month_folder
-                else:
-                    month_name = "Unknown"
-                
-                file_count = len(files_in_month) * (2 if final_separate_transcripts else 1)
-                print(f"\n  {Colors.CYAN}📂 {Colors.BOLD}{month_name}{Colors.END} ({Colors.CYAN}{month_folder}/{Colors.END})")
-                print(f"     {Colors.GREEN}{file_count}{Colors.END} files, {Colors.BOLD}{total_conversations}{Colors.END} total conversations")
-                for day_key, filename, count, transcript_filename, transcript_count in sorted(files_in_month):
-                    if final_separate_transcripts:
-                        print(f"     {Colors.CYAN}•{Colors.END} {filename}: {Colors.BOLD}{count}{Colors.END} conversations")
-                        if transcript_count > 0:
-                            print(f"     {Colors.CYAN}•{Colors.END} {transcript_filename}: {Colors.BOLD}{transcript_count}{Colors.END} transcripts")
-                    else:
-                        print(f"     {Colors.CYAN}•{Colors.END} {filename}: {Colors.BOLD}{count}{Colors.END} conversations")
-        else:
-            # Simple flat list when not organizing by month
-            print(f"\n{Colors.CYAN}Files saved in '{EXPORT_FOLDER}/':{Colors.END}")
-            for day_key in sorted(conversations_by_day.keys()):
-                day_conversations = conversations_by_day[day_key]
-                if day_key == "unknown":
-                    base_filename = "conversation_export_unknown"
-                else:
-                    base_filename = f"conversation_export_{day_key}"
-                
-                if final_separate_transcripts:
-                    conversations_with_transcripts = sum(1 for conv in day_conversations if conv.get("transcript_segments"))
-                    print(f"  {Colors.CYAN}•{Colors.END} {base_filename}.json: {Colors.BOLD}{len(day_conversations)}{Colors.END} conversations")
-                    if conversations_with_transcripts > 0:
-                        print(f"  {Colors.CYAN}•{Colors.END} {base_filename}_transcripts.json: {Colors.BOLD}{conversations_with_transcripts}{Colors.END} transcripts")
-                else:
-                    filename = f"{base_filename}.json"
-                    print(f"  {Colors.CYAN}•{Colors.END} {filename}: {Colors.BOLD}{len(day_conversations)}{Colors.END} conversations")
-        
-        print_success(f"\n🎊 All conversation files saved successfully!")
-    
-    # Export memories if requested
-    if export_memories:
-        print_header("💭 MEMORY EXPORT")
-        print_info(f"Fetching memories...")
+                    print(f"     {Colors.CYAN}•{Colors.END} {filename}: {Colors.BOLD}{count}{Colors.END} conversations")
+    else:
+        # Simple flat list when not organizing by month
+        print(f"\n{Colors.CYAN}Files saved in '{EXPORT_FOLDER}/':{Colors.END}")
+        for day_key in sorted(conversations_by_day.keys()):
+            day_conversations = conversations_by_day[day_key]
+            if day_key == "unknown":
+                base_filename = "conversation_export_unknown"
+            else:
+                base_filename = f"conversation_export_{day_key}"
+
+            if final_separate_transcripts:
+                conversations_with_transcripts = sum(1 for conv in day_conversations if conv.get("transcript_segments"))
+                print(f"  {Colors.CYAN}•{Colors.END} {base_filename}.json: {Colors.BOLD}{len(day_conversations)}{Colors.END} conversations")
+                if conversations_with_transcripts > 0:
+                    print(f"  {Colors.CYAN}•{Colors.END} {base_filename}_transcripts.json: {Colors.BOLD}{conversations_with_transcripts}{Colors.END} transcripts")
+            else:
+                filename = f"{base_filename}.json"
+                print(f"  {Colors.CYAN}•{Colors.END} {filename}: {Colors.BOLD}{len(day_conversations)}{Colors.END} conversations")
+
+    print_success(f"\n🎊 All conversation files saved successfully!")
+
+# Export memories if requested
+if export_memories:
+    print_header("💭 MEMORY EXPORT")
+    print_info(f"Fetching memories...")
+    if final_memory_categories:
+        print_info(f"Filtering by categories: {Colors.BOLD}{final_memory_categories}{Colors.END}")
+    print()
+
+    # Fetch all memories
+    memories = get_memories(limit=final_memory_limit, offset=0, categories=final_memory_categories)
+
+    if memories:
+        # Create memories folder
+        memories_folder = os.path.join(EXPORT_FOLDER, "memories")
+        os.makedirs(memories_folder, exist_ok=True)
+
+        # Save all memories to a single file
+        memories_filename = "memories_export.json"
         if final_memory_categories:
-            print_info(f"Filtering by categories: {Colors.BOLD}{final_memory_categories}{Colors.END}")
-        print()
-        
-        # Fetch all memories
-        memories = get_memories(limit=final_memory_limit, offset=0, categories=final_memory_categories)
-        
+            # Include categories in filename
+            safe_categories = final_memory_categories.replace(",", "_").replace(" ", "")
+            memories_filename = f"memories_export_{safe_categories}.json"
+
+        memories_filepath = os.path.join(memories_folder, memories_filename)
+
+        with open(memories_filepath, "w") as f:
+            json.dump(memories, f, indent=4)
+
+        print_success(f"\n💾 Saved {Colors.BOLD}{len(memories)}{Colors.END} memories to: {Colors.CYAN}{memories_folder}/{memories_filename}{Colors.END}")
+
+        # Show category breakdown if available
         if memories:
-            # Create memories folder
-            memories_folder = os.path.join(EXPORT_FOLDER, "memories")
-            os.makedirs(memories_folder, exist_ok=True)
-            
-            # Save all memories to a single file
-            memories_filename = "memories_export.json"
-            if final_memory_categories:
-                # Include categories in filename
-                safe_categories = final_memory_categories.replace(",", "_").replace(" ", "")
-                memories_filename = f"memories_export_{safe_categories}.json"
-            
-            memories_filepath = os.path.join(memories_folder, memories_filename)
-            
-            with open(memories_filepath, "w") as f:
-                json.dump(memories, f, indent=4)
-            
-            print_success(f"\n💾 Saved {Colors.BOLD}{len(memories)}{Colors.END} memories to: {Colors.CYAN}{memories_folder}/{memories_filename}{Colors.END}")
-            
-            # Show category breakdown if available
-            if memories:
-                categories_count = defaultdict(int)
-                for memory in memories:
-                    category = memory.get("category", "unknown")
-                    categories_count[category] += 1
-                
-                if len(categories_count) > 1:
-                    print_info(f"\nMemory breakdown by category:")
-                    for category, count in sorted(categories_count.items()):
-                        print_info(f"  • {Colors.BOLD}{category}{Colors.END}: {count}")
-        else:
-            print_warning("No memories found.")
-    
-    # Final overall summary
-    print_header("🎉 EXPORT COMPLETE!")
-    if export_conversations:
-        print_success(f"Conversations: {Colors.BOLD}{len(results)}{Colors.END} exported")
-    if export_memories:
-        print_success(f"Memories: {Colors.BOLD}{len(memories)}{Colors.END} exported")
-    print_success(f"\n🎊 All exports saved successfully!")
+            categories_count = defaultdict(int)
+            for memory in memories:
+                category = memory.get("category", "unknown")
+                categories_count[category] += 1
+
+            if len(categories_count) > 1:
+                print_info(f"\nMemory breakdown by category:")
+                for category, count in sorted(categories_count.items()):
+                    print_info(f"  • {Colors.BOLD}{category}{Colors.END}: {count}")
+    else:
+        print_warning("No memories found.")
+
+# Final overall summary
+print_header("🎉 EXPORT COMPLETE!")
+if export_conversations:
+    print_success(f"Conversations: {Colors.BOLD}{len(results)}{Colors.END} exported")
+if export_memories:
+    print_success(f"Memories: {Colors.BOLD}{len(memories)}{Colors.END} exported")
+print_success(f"\n🎊 All exports saved successfully!")
