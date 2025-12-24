@@ -662,12 +662,12 @@ def get_memories(limit=100, offset=0, categories=None):
                 break
             
             all_memories.extend(data)
-            print_info(f"Retrieved {Colors.BOLD}{len(data)}{Colors.END} memories from offset {current_offset} (requested limit: {limit}, total so far: {Colors.BOLD}{len(all_memories)}{Colors.END})")
-            
-            # Continue fetching - only stop when we get 0 results (handled above)
-            # The API might return fewer items than requested even if there are more pages
-            current_offset += len(data)  # Use actual count returned, not requested limit
-            
+            print_info(f"Retrieved {Colors.BOLD}{len(data)}{Colors.END} memories from offset {current_offset} (total so far: {Colors.BOLD}{len(all_memories)}{Colors.END})")
+
+            # Always increment by the requested limit, not the returned count
+            # The API uses fixed offset pagination, not cursor-based
+            current_offset += limit
+
             # Small delay to be polite
             time.sleep(REQUEST_DELAY)
             
@@ -1065,273 +1065,273 @@ Examples:
             print_success(f"Export folder '{EXPORT_FOLDER}' ready (files will be organized by month)\n")
         else:
             print_success(f"Export folder '{EXPORT_FOLDER}' ready (all files in single folder)\n")
-    
-    # Group conversations by day (will be populated incrementally)
-    conversations_by_day = defaultdict(list)
-    files_written = set()  # Track which files we've already written
-    file_lock = Lock()  # Thread lock for safe file writing
-    
-    def parse_timestamp(timestamp_value):
-        """
-        Parse a timestamp value into a UTC datetime object.
-        Handles various formats: ISO 8601 strings, Unix timestamps, etc.
-        """
-        if timestamp_value is None:
+
+        # Group conversations by day (will be populated incrementally)
+        conversations_by_day = defaultdict(list)
+        files_written = set()  # Track which files we've already written
+        file_lock = Lock()  # Thread lock for safe file writing
+
+        def parse_timestamp(timestamp_value):
+            """
+            Parse a timestamp value into a UTC datetime object.
+            Handles various formats: ISO 8601 strings, Unix timestamps, etc.
+            """
+            if timestamp_value is None:
+                return None
+
+            try:
+                if isinstance(timestamp_value, str):
+                    # Handle ISO 8601 format strings
+                    # Replace 'Z' with '+00:00' for proper parsing
+                    timestamp_str = timestamp_value.replace('Z', '+00:00')
+                    # Try parsing with timezone info
+                    try:
+                        dt = datetime.fromisoformat(timestamp_str)
+                    except ValueError:
+                        # Try parsing without timezone and assume UTC
+                        dt = datetime.fromisoformat(timestamp_value.replace('Z', ''))
+                        dt = dt.replace(tzinfo=ZoneInfo("UTC"))
+
+                    # Ensure timezone info exists
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=ZoneInfo("UTC"))
+                    else:
+                        # Convert to UTC if it has timezone info
+                        dt = dt.astimezone(ZoneInfo("UTC"))
+
+                    return dt
+                elif isinstance(timestamp_value, (int, float)):
+                    # Unix timestamp (seconds since epoch)
+                    return datetime.fromtimestamp(timestamp_value, tz=ZoneInfo("UTC"))
+                elif isinstance(timestamp_value, datetime):
+                    # Already a datetime object
+                    if timestamp_value.tzinfo is None:
+                        return timestamp_value.replace(tzinfo=ZoneInfo("UTC"))
+                    return timestamp_value.astimezone(ZoneInfo("UTC"))
+            except (ValueError, TypeError, OSError):
+                return None
+
             return None
-            
-        try:
-            if isinstance(timestamp_value, str):
-                # Handle ISO 8601 format strings
-                # Replace 'Z' with '+00:00' for proper parsing
-                timestamp_str = timestamp_value.replace('Z', '+00:00')
-                # Try parsing with timezone info
-                try:
-                    dt = datetime.fromisoformat(timestamp_str)
-                except ValueError:
-                    # Try parsing without timezone and assume UTC
-                    dt = datetime.fromisoformat(timestamp_value.replace('Z', ''))
-                    dt = dt.replace(tzinfo=ZoneInfo("UTC"))
-                
-                # Ensure timezone info exists
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=ZoneInfo("UTC"))
-                else:
-                    # Convert to UTC if it has timezone info
-                    dt = dt.astimezone(ZoneInfo("UTC"))
-                
-                return dt
-            elif isinstance(timestamp_value, (int, float)):
-                # Unix timestamp (seconds since epoch)
-                return datetime.fromtimestamp(timestamp_value, tz=ZoneInfo("UTC"))
-            elif isinstance(timestamp_value, datetime):
-                # Already a datetime object
-                if timestamp_value.tzinfo is None:
-                    return timestamp_value.replace(tzinfo=ZoneInfo("UTC"))
-                return timestamp_value.astimezone(ZoneInfo("UTC"))
-        except (ValueError, TypeError, OSError):
-            return None
-        
-        return None
-    
-    def process_batch(batch_conversations, total_count):
-        """
-        Process a batch of conversations: group by day and save files incrementally.
-        Thread-safe version for parallel processing.
-        """
-        new_days_found = []
-        
-        # Process conversations and group by day (thread-safe)
-        with file_lock:
-            for conversation in batch_conversations:
-                # Extract the timestamp from the conversation (assuming it's in UTC from the API)
-                timestamp_utc = None
-                
-                # Try common timestamp field names in order of likelihood
-                for field in ['created_at', 'timestamp', 'date', 'time', 'started_at', 'updated_at', 'created', 'start_time']:
-                    if field in conversation:
-                        timestamp_utc = parse_timestamp(conversation[field])
-                        if timestamp_utc:
-                            break
-                
-                if timestamp_utc:
-                    # Convert to user's timezone to determine which day it belongs to
-                    timestamp_local = timestamp_utc.astimezone(user_tz)
-                    day_key = timestamp_local.strftime("%Y-%m-%d")
-                    conversations_by_day[day_key].append(conversation)
-                    
-                    # Track new days we've found
-                    if day_key not in files_written:
-                        new_days_found.append(day_key)
-                else:
-                    # If we can't determine the day, put it in a special "unknown" category
-                    conversations_by_day["unknown"].append(conversation)
-                    if "unknown" not in files_written:
-                        new_days_found.append("unknown")
-            
-            # Save files for any new days we found, or update existing ones
-            days_to_save = set(new_days_found)
-            # Also save files for days that have new conversations (in case we're updating)
-            for day_key in conversations_by_day.keys():
-                if day_key not in files_written or day_key in new_days_found:
-                    days_to_save.add(day_key)
-        
-        # Save files for the days we've updated (thread-safe)
-        with file_lock:
-            for day_key in sorted(days_to_save):
-                day_conversations = conversations_by_day[day_key]
-                
-                if day_key == "unknown":
-                    base_filename = f"conversation_export_unknown"
-                else:
-                    # Extract just the date part (YYYY-MM-DD) for filename
-                    base_filename = f"conversation_export_{day_key}"
-                
-                # Determine folder path based on final_organize_by_month setting
-                if final_organize_by_month:
+
+        def process_batch(batch_conversations, total_count):
+            """
+            Process a batch of conversations: group by day and save files incrementally.
+            Thread-safe version for parallel processing.
+            """
+            new_days_found = []
+
+            # Process conversations and group by day (thread-safe)
+            with file_lock:
+                for conversation in batch_conversations:
+                    # Extract the timestamp from the conversation (assuming it's in UTC from the API)
+                    timestamp_utc = None
+
+                    # Try common timestamp field names in order of likelihood
+                    for field in ['created_at', 'timestamp', 'date', 'time', 'started_at', 'updated_at', 'created', 'start_time']:
+                        if field in conversation:
+                            timestamp_utc = parse_timestamp(conversation[field])
+                            if timestamp_utc:
+                                break
+
+                    if timestamp_utc:
+                        # Convert to user's timezone to determine which day it belongs to
+                        timestamp_local = timestamp_utc.astimezone(user_tz)
+                        day_key = timestamp_local.strftime("%Y-%m-%d")
+                        conversations_by_day[day_key].append(conversation)
+
+                        # Track new days we've found
+                        if day_key not in files_written:
+                            new_days_found.append(day_key)
+                    else:
+                        # If we can't determine the day, put it in a special "unknown" category
+                        conversations_by_day["unknown"].append(conversation)
+                        if "unknown" not in files_written:
+                            new_days_found.append("unknown")
+
+                # Save files for any new days we found, or update existing ones
+                days_to_save = set(new_days_found)
+                # Also save files for days that have new conversations (in case we're updating)
+                for day_key in conversations_by_day.keys():
+                    if day_key not in files_written or day_key in new_days_found:
+                        days_to_save.add(day_key)
+
+            # Save files for the days we've updated (thread-safe)
+            with file_lock:
+                for day_key in sorted(days_to_save):
+                    day_conversations = conversations_by_day[day_key]
+
                     if day_key == "unknown":
-                        # Unknown conversations go in a special folder
-                        month_folder = "unknown"
+                        base_filename = f"conversation_export_unknown"
                     else:
-                        # Extract year-month from day_key (format: YYYY-MM-DD)
-                        year_month = day_key[:7]  # Gets "YYYY-MM"
-                        month_folder = year_month
-                    
-                    # Create month folder if it doesn't exist
-                    month_folder_path = os.path.join(EXPORT_FOLDER, month_folder)
-                    os.makedirs(month_folder_path, exist_ok=True)
-                    base_path = month_folder_path
-                    display_prefix = f"{month_folder}/"
-                else:
-                    # Save all files directly in the export folder
-                    base_path = EXPORT_FOLDER
-                    display_prefix = ""
-                
-                if final_separate_transcripts:
-                    # Separate transcripts from conversation metadata
-                    conversations_metadata = []
-                    transcripts_data = []
-                    
-                    for conv in day_conversations:
-                        # Extract transcript_segments if they exist
-                        transcript_segments = conv.get("transcript_segments", [])
-                        
-                        # Create conversation metadata without transcripts
-                        conv_metadata = {k: v for k, v in conv.items() if k != "transcript_segments"}
-                        conversations_metadata.append(conv_metadata)
-                        
-                        # Create transcript entry with conversation ID and segments
-                        if transcript_segments:
-                            transcripts_data.append({
-                                "conversation_id": conv.get("id"),
-                                "created_at": conv.get("created_at"),
-                                "transcript_segments": transcript_segments
-                            })
-                    
-                    # Save conversation metadata file
-                    metadata_filename = f"{base_filename}.json"
-                    metadata_filepath = os.path.join(base_path, metadata_filename)
-                    with open(metadata_filepath, "w") as f:
-                        json.dump(conversations_metadata, f, indent=4)
-                    
-                    # Save transcripts file (only if there are transcripts)
-                    if transcripts_data:
-                        transcript_filename = f"{base_filename}_transcripts.json"
-                        transcript_filepath = os.path.join(base_path, transcript_filename)
-                        with open(transcript_filepath, "w") as f:
-                            json.dump(transcripts_data, f, indent=4)
-                        
-                        if day_key not in files_written:
-                            print(f"  {Colors.GREEN}📁 Created files:{Colors.END} {Colors.CYAN}{display_prefix}{metadata_filename}{Colors.END} ({Colors.BOLD}{len(conversations_metadata)}{Colors.END} conversations)")
-                            print(f"                  {Colors.CYAN}{display_prefix}{transcript_filename}{Colors.END} ({Colors.BOLD}{len(transcripts_data)}{Colors.END} transcripts)")
-                        elif day_key in new_days_found:
-                            print(f"  {Colors.BLUE}💾 Updated files:{Colors.END} {Colors.CYAN}{display_prefix}{metadata_filename}{Colors.END} ({Colors.BOLD}{len(conversations_metadata)}{Colors.END} conversations)")
-                            print(f"                  {Colors.CYAN}{display_prefix}{transcript_filename}{Colors.END} ({Colors.BOLD}{len(transcripts_data)}{Colors.END} transcripts)")
+                        # Extract just the date part (YYYY-MM-DD) for filename
+                        base_filename = f"conversation_export_{day_key}"
+
+                    # Determine folder path based on final_organize_by_month setting
+                    if final_organize_by_month:
+                        if day_key == "unknown":
+                            # Unknown conversations go in a special folder
+                            month_folder = "unknown"
+                        else:
+                            # Extract year-month from day_key (format: YYYY-MM-DD)
+                            year_month = day_key[:7]  # Gets "YYYY-MM"
+                            month_folder = year_month
+
+                        # Create month folder if it doesn't exist
+                        month_folder_path = os.path.join(EXPORT_FOLDER, month_folder)
+                        os.makedirs(month_folder_path, exist_ok=True)
+                        base_path = month_folder_path
+                        display_prefix = f"{month_folder}/"
                     else:
-                        # No transcripts, just save metadata
+                        # Save all files directly in the export folder
+                        base_path = EXPORT_FOLDER
+                        display_prefix = ""
+
+                    if final_separate_transcripts:
+                        # Separate transcripts from conversation metadata
+                        conversations_metadata = []
+                        transcripts_data = []
+
+                        for conv in day_conversations:
+                            # Extract transcript_segments if they exist
+                            transcript_segments = conv.get("transcript_segments", [])
+
+                            # Create conversation metadata without transcripts
+                            conv_metadata = {k: v for k, v in conv.items() if k != "transcript_segments"}
+                            conversations_metadata.append(conv_metadata)
+
+                            # Create transcript entry with conversation ID and segments
+                            if transcript_segments:
+                                transcripts_data.append({
+                                    "conversation_id": conv.get("id"),
+                                    "created_at": conv.get("created_at"),
+                                    "transcript_segments": transcript_segments
+                                })
+
+                        # Save conversation metadata file
+                        metadata_filename = f"{base_filename}.json"
+                        metadata_filepath = os.path.join(base_path, metadata_filename)
+                        with open(metadata_filepath, "w") as f:
+                            json.dump(conversations_metadata, f, indent=4)
+
+                        # Save transcripts file (only if there are transcripts)
+                        if transcripts_data:
+                            transcript_filename = f"{base_filename}_transcripts.json"
+                            transcript_filepath = os.path.join(base_path, transcript_filename)
+                            with open(transcript_filepath, "w") as f:
+                                json.dump(transcripts_data, f, indent=4)
+
+                            if day_key not in files_written:
+                                print(f"  {Colors.GREEN}📁 Created files:{Colors.END} {Colors.CYAN}{display_prefix}{metadata_filename}{Colors.END} ({Colors.BOLD}{len(conversations_metadata)}{Colors.END} conversations)")
+                                print(f"                  {Colors.CYAN}{display_prefix}{transcript_filename}{Colors.END} ({Colors.BOLD}{len(transcripts_data)}{Colors.END} transcripts)")
+                            elif day_key in new_days_found:
+                                print(f"  {Colors.BLUE}💾 Updated files:{Colors.END} {Colors.CYAN}{display_prefix}{metadata_filename}{Colors.END} ({Colors.BOLD}{len(conversations_metadata)}{Colors.END} conversations)")
+                                print(f"                  {Colors.CYAN}{display_prefix}{transcript_filename}{Colors.END} ({Colors.BOLD}{len(transcripts_data)}{Colors.END} transcripts)")
+                        else:
+                            # No transcripts, just save metadata
+                            if day_key not in files_written:
+                                print(f"  {Colors.GREEN}📁 Created file:{Colors.END} {Colors.CYAN}{display_prefix}{metadata_filename}{Colors.END} ({Colors.BOLD}{len(conversations_metadata)}{Colors.END} conversations, no transcripts)")
+                            elif day_key in new_days_found:
+                                print(f"  {Colors.BLUE}💾 Updated file:{Colors.END} {Colors.CYAN}{display_prefix}{metadata_filename}{Colors.END} ({Colors.BOLD}{len(conversations_metadata)}{Colors.END} conversations)")
+                    else:
+                        # Save everything together (original behavior)
+                        filename = f"{base_filename}.json"
+                        filepath = os.path.join(base_path, filename)
+                        display_path = f"{display_prefix}{filename}"
+
+                        with open(filepath, "w") as f:
+                            json.dump(day_conversations, f, indent=4)
+
                         if day_key not in files_written:
-                            print(f"  {Colors.GREEN}📁 Created file:{Colors.END} {Colors.CYAN}{display_prefix}{metadata_filename}{Colors.END} ({Colors.BOLD}{len(conversations_metadata)}{Colors.END} conversations, no transcripts)")
+                            print(f"  {Colors.GREEN}📁 Created file:{Colors.END} {Colors.CYAN}{display_path}{Colors.END} ({Colors.BOLD}{len(day_conversations)}{Colors.END} conversations)")
                         elif day_key in new_days_found:
-                            print(f"  {Colors.BLUE}💾 Updated file:{Colors.END} {Colors.CYAN}{display_prefix}{metadata_filename}{Colors.END} ({Colors.BOLD}{len(conversations_metadata)}{Colors.END} conversations)")
-                else:
-                    # Save everything together (original behavior)
-                    filename = f"{base_filename}.json"
-                    filepath = os.path.join(base_path, filename)
-                    display_path = f"{display_prefix}{filename}"
-                    
-                    with open(filepath, "w") as f:
-                        json.dump(day_conversations, f, indent=4)
-                    
+                            print(f"  {Colors.BLUE}💾 Updated file:{Colors.END} {Colors.CYAN}{display_path}{Colors.END} (now {Colors.BOLD}{len(day_conversations)}{Colors.END} conversations)")
+
                     if day_key not in files_written:
-                        print(f"  {Colors.GREEN}📁 Created file:{Colors.END} {Colors.CYAN}{display_path}{Colors.END} ({Colors.BOLD}{len(day_conversations)}{Colors.END} conversations)")
-                    elif day_key in new_days_found:
-                        print(f"  {Colors.BLUE}💾 Updated file:{Colors.END} {Colors.CYAN}{display_path}{Colors.END} (now {Colors.BOLD}{len(day_conversations)}{Colors.END} conversations)")
-                
-                if day_key not in files_written:
-                    files_written.add(day_key)
+                        files_written.add(day_key)
 
-    # Run the retrieval function with incremental processing callback
-    print_info("🚀 Starting conversation retrieval...\n")
-    results = get_conversations(start_date=QUERY_START, end_date=QUERY_END, callback=process_batch)
+        # Run the retrieval function with incremental processing callback
+        print_info("🚀 Starting conversation retrieval...\n")
+        results = get_conversations(start_date=QUERY_START, end_date=QUERY_END, callback=process_batch)
 
-    # Final summary for conversations
-    print_header("🎉 CONVERSATION EXPORT COMPLETE!")
-    print_success(f"Total conversations retrieved: {Colors.BOLD}{len(results)}{Colors.END}")
-    print_success(f"Total days with conversations: {Colors.BOLD}{len([k for k in conversations_by_day.keys() if k != 'unknown'])}{Colors.END}")
+        # Final summary for conversations
+        print_header("🎉 CONVERSATION EXPORT COMPLETE!")
+        print_success(f"Total conversations retrieved: {Colors.BOLD}{len(results)}{Colors.END}")
+        print_success(f"Total days with conversations: {Colors.BOLD}{len([k for k in conversations_by_day.keys() if k != 'unknown'])}{Colors.END}")
 
-    if final_organize_by_month:
-        # Group files by month for summary
-        files_by_month = defaultdict(list)
-        for day_key in conversations_by_day.keys():
-            if day_key == "unknown":
-                month_folder = "unknown"
-                base_filename = "conversation_export_unknown"
-            else:
-                year_month = day_key[:7]  # Gets "YYYY-MM"
-                month_folder = year_month
-                base_filename = f"conversation_export_{day_key}"
-
-            day_conversations = conversations_by_day[day_key]
-
-            if final_separate_transcripts:
-                # Count conversations with transcripts
-                conversations_with_transcripts = sum(1 for conv in day_conversations if conv.get("transcript_segments"))
-                metadata_filename = f"{base_filename}.json"
-                transcript_filename = f"{base_filename}_transcripts.json"
-                files_by_month[month_folder].append((day_key, metadata_filename, len(day_conversations), transcript_filename, conversations_with_transcripts))
-            else:
-                filename = f"{base_filename}.json"
-                files_by_month[month_folder].append((day_key, filename, len(day_conversations), None, 0))
-
-        print(f"\n{Colors.CYAN}📁 Files organized by month in '{EXPORT_FOLDER}/':{Colors.END}")
-
-        # Print summary organized by month
-        for month_folder in sorted(files_by_month.keys()):
-            files_in_month = files_by_month[month_folder]
-            total_conversations = sum(count for _, _, count, _, _ in files_in_month)
-
-            # Format month name nicely (e.g., "2025-01" -> "January 2025")
-            if month_folder != "unknown":
-                try:
-                    year, month = month_folder.split("-")
-                    month_num = int(month)
-                    month_names = ["", "January", "February", "March", "April", "May", "June",
-                                  "July", "August", "September", "October", "November", "December"]
-                    month_name = f"{month_names[month_num]} {year}"
-                except:
-                    month_name = month_folder
-            else:
-                month_name = "Unknown"
-
-            file_count = len(files_in_month) * (2 if final_separate_transcripts else 1)
-            print(f"\n  {Colors.CYAN}📂 {Colors.BOLD}{month_name}{Colors.END} ({Colors.CYAN}{month_folder}/{Colors.END})")
-            print(f"     {Colors.GREEN}{file_count}{Colors.END} files, {Colors.BOLD}{total_conversations}{Colors.END} total conversations")
-            for day_key, filename, count, transcript_filename, transcript_count in sorted(files_in_month):
-                if final_separate_transcripts:
-                    print(f"     {Colors.CYAN}•{Colors.END} {filename}: {Colors.BOLD}{count}{Colors.END} conversations")
-                    if transcript_count > 0:
-                        print(f"     {Colors.CYAN}•{Colors.END} {transcript_filename}: {Colors.BOLD}{transcript_count}{Colors.END} transcripts")
+        if final_organize_by_month:
+            # Group files by month for summary
+            files_by_month = defaultdict(list)
+            for day_key in conversations_by_day.keys():
+                if day_key == "unknown":
+                    month_folder = "unknown"
+                    base_filename = "conversation_export_unknown"
                 else:
-                    print(f"     {Colors.CYAN}•{Colors.END} {filename}: {Colors.BOLD}{count}{Colors.END} conversations")
-    else:
-        # Simple flat list when not organizing by month
-        print(f"\n{Colors.CYAN}Files saved in '{EXPORT_FOLDER}/':{Colors.END}")
-        for day_key in sorted(conversations_by_day.keys()):
-            day_conversations = conversations_by_day[day_key]
-            if day_key == "unknown":
-                base_filename = "conversation_export_unknown"
-            else:
-                base_filename = f"conversation_export_{day_key}"
+                    year_month = day_key[:7]  # Gets "YYYY-MM"
+                    month_folder = year_month
+                    base_filename = f"conversation_export_{day_key}"
 
-            if final_separate_transcripts:
-                conversations_with_transcripts = sum(1 for conv in day_conversations if conv.get("transcript_segments"))
-                print(f"  {Colors.CYAN}•{Colors.END} {base_filename}.json: {Colors.BOLD}{len(day_conversations)}{Colors.END} conversations")
-                if conversations_with_transcripts > 0:
-                    print(f"  {Colors.CYAN}•{Colors.END} {base_filename}_transcripts.json: {Colors.BOLD}{conversations_with_transcripts}{Colors.END} transcripts")
-            else:
-                filename = f"{base_filename}.json"
-                print(f"  {Colors.CYAN}•{Colors.END} {filename}: {Colors.BOLD}{len(day_conversations)}{Colors.END} conversations")
+                day_conversations = conversations_by_day[day_key]
 
-    print_success(f"\n🎊 All conversation files saved successfully!")
+                if final_separate_transcripts:
+                    # Count conversations with transcripts
+                    conversations_with_transcripts = sum(1 for conv in day_conversations if conv.get("transcript_segments"))
+                    metadata_filename = f"{base_filename}.json"
+                    transcript_filename = f"{base_filename}_transcripts.json"
+                    files_by_month[month_folder].append((day_key, metadata_filename, len(day_conversations), transcript_filename, conversations_with_transcripts))
+                else:
+                    filename = f"{base_filename}.json"
+                    files_by_month[month_folder].append((day_key, filename, len(day_conversations), None, 0))
+
+            print(f"\n{Colors.CYAN}📁 Files organized by month in '{EXPORT_FOLDER}/':{Colors.END}")
+
+            # Print summary organized by month
+            for month_folder in sorted(files_by_month.keys()):
+                files_in_month = files_by_month[month_folder]
+                total_conversations = sum(count for _, _, count, _, _ in files_in_month)
+
+                # Format month name nicely (e.g., "2025-01" -> "January 2025")
+                if month_folder != "unknown":
+                    try:
+                        year, month = month_folder.split("-")
+                        month_num = int(month)
+                        month_names = ["", "January", "February", "March", "April", "May", "June",
+                                      "July", "August", "September", "October", "November", "December"]
+                        month_name = f"{month_names[month_num]} {year}"
+                    except:
+                        month_name = month_folder
+                else:
+                    month_name = "Unknown"
+
+                file_count = len(files_in_month) * (2 if final_separate_transcripts else 1)
+                print(f"\n  {Colors.CYAN}📂 {Colors.BOLD}{month_name}{Colors.END} ({Colors.CYAN}{month_folder}/{Colors.END})")
+                print(f"     {Colors.GREEN}{file_count}{Colors.END} files, {Colors.BOLD}{total_conversations}{Colors.END} total conversations")
+                for day_key, filename, count, transcript_filename, transcript_count in sorted(files_in_month):
+                    if final_separate_transcripts:
+                        print(f"     {Colors.CYAN}•{Colors.END} {filename}: {Colors.BOLD}{count}{Colors.END} conversations")
+                        if transcript_count > 0:
+                            print(f"     {Colors.CYAN}•{Colors.END} {transcript_filename}: {Colors.BOLD}{transcript_count}{Colors.END} transcripts")
+                    else:
+                        print(f"     {Colors.CYAN}•{Colors.END} {filename}: {Colors.BOLD}{count}{Colors.END} conversations")
+        else:
+            # Simple flat list when not organizing by month
+            print(f"\n{Colors.CYAN}Files saved in '{EXPORT_FOLDER}/':{Colors.END}")
+            for day_key in sorted(conversations_by_day.keys()):
+                day_conversations = conversations_by_day[day_key]
+                if day_key == "unknown":
+                    base_filename = "conversation_export_unknown"
+                else:
+                    base_filename = f"conversation_export_{day_key}"
+
+                if final_separate_transcripts:
+                    conversations_with_transcripts = sum(1 for conv in day_conversations if conv.get("transcript_segments"))
+                    print(f"  {Colors.CYAN}•{Colors.END} {base_filename}.json: {Colors.BOLD}{len(day_conversations)}{Colors.END} conversations")
+                    if conversations_with_transcripts > 0:
+                        print(f"  {Colors.CYAN}•{Colors.END} {base_filename}_transcripts.json: {Colors.BOLD}{conversations_with_transcripts}{Colors.END} transcripts")
+                else:
+                    filename = f"{base_filename}.json"
+                    print(f"  {Colors.CYAN}•{Colors.END} {filename}: {Colors.BOLD}{len(day_conversations)}{Colors.END} conversations")
+
+        print_success(f"\n🎊 All conversation files saved successfully!")
 
 # Export memories if requested
 if export_memories:
